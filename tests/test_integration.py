@@ -1,0 +1,391 @@
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+import pytest
+
+from rangecontract import __version__
+
+
+class Repo:
+    def __init__(self, root):
+        self.root = root
+        self.env = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
+        self.env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+    def git_bytes(self, *argv, data=None):
+        return subprocess.run(
+            ["git", "-C", str(self.root), *argv], env=self.env, input=data,
+            check=True, capture_output=True, timeout=30,
+        ).stdout
+
+    def git(self, *argv):
+        return self.git_bytes(*argv).decode("utf-8").strip()
+
+    def commit_raw_path(self, raw_path):
+        oid = self.git_bytes("hash-object", "-w", "--stdin", data=b"contents").strip()
+        self.git_bytes(
+            "-c", "core.protectNTFS=false", "update-index", "-z", "--index-info",
+            data=b"100644 " + oid + b"\t" + raw_path + b"\0",
+        )
+        self.git("commit", "--quiet", "-m", "add raw path")
+
+    def write(self, relative, content):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
+
+    def commit(self, message):
+        self.git("add", "--all")
+        self.git("commit", "--quiet", "--allow-empty", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+
+@pytest.fixture
+def repo(tmp_path):
+    root = tmp_path / "checkout with spaces"
+    root.mkdir()
+    repository = Repo(root)
+    repository.git("init", "--quiet", "--initial-branch=main", "--template=")
+    repository.git("config", "user.name", "RangeContract Tests")
+    repository.git("config", "user.email", "rangecontract@example.invalid")
+    repository.git("config", "core.autocrlf", "false")
+    return repository
+
+
+def cli(*args, **kwargs):
+    return subprocess.run(
+        [sys.executable, "-B", "-m", "rangecontract", *map(str, args)],
+        capture_output=True, text=True, timeout=45, **kwargs,
+    )
+
+
+def contract(repo, base, *, allowed=("**",), forbidden=(), maximum=20, checks=()):
+    path = repo.root.parent / "policy.toml"
+    lines = [
+        f'base_commit = "{base}"',
+        f"allowed_paths = {json.dumps(allowed, ensure_ascii=False)}",
+        f"forbidden_paths = {json.dumps(forbidden, ensure_ascii=False)}",
+        f"max_changed_files = {maximum}",
+    ]
+    for name, argv, timeout in checks:
+        lines.extend([
+            "[[checks]]",
+            f"name = {json.dumps(name)}",
+            f"argv = {json.dumps(argv)}",
+            f"timeout_seconds = {timeout}",
+        ])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def verify(repo, path, *flags):
+    completed = cli("verify", "--repo", repo.root, "--contract", path, "--json", *flags)
+    assert completed.stderr == ""
+    return completed.returncode, json.loads(completed.stdout)
+
+
+def python_check(source, name="validate", timeout=15):
+    return name, [sys.executable, "-I", "-B", "-c", source], timeout
+
+
+def test_init_version_and_no_overwrite(repo):
+    base = repo.commit("base")
+    path = repo.root.parent / "new.toml"
+    args = ("init", "--repo", repo.root, "--base", "main", "--contract", path)
+    assert cli(*args).returncode == 0
+    assert base.encode() in path.read_bytes()
+    old = path.read_bytes()
+    assert cli(*args).returncode == 2
+    assert path.read_bytes() == old
+    assert verify(repo, path)[0] == 0
+    version = cli("version")
+    assert (version.returncode, version.stdout.strip()) == (0, f"rangecontract {__version__}")
+
+
+def test_exact_range_modification_addition_deletion_and_hash(repo):
+    repo.write("src/edit.txt", "old")
+    repo.write("src/remove.txt", "old content for the deletion")
+    base = repo.commit("base")
+    repo.write("src/edit.txt", "updated")
+    repo.write("src/new [1].txt", "entirely different added contents")
+    (repo.root / "src/remove.txt").unlink()
+    target = repo.commit("target")
+    repo.git("tag", "-a", "reviewed", "-m", "reviewed")
+    policy = contract(repo, base, allowed=("src/*.txt",), maximum=3)
+
+    code, report = verify(repo, policy, "--target", "reviewed")
+    assert (code, report["status"], report["validation"]) == (0, "PASS", "NOT_REQUIRED")
+    assert (report["base_commit"], report["target_commit"]) == (base, target)
+    assert report["contract_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+    assert [(item["status"], item["paths"][0]) for item in report["changes"]] == [
+        ("M", "src/edit.txt"), ("A", "src/new [1].txt"), ("D", "src/remove.txt"),
+    ]
+
+    repo.write("in-progress.txt", "untracked")
+    repo.write("src/edit.txt", "staged edit unrelated to the target")
+    repo.git("add", "src/edit.txt")
+    assert verify(repo, policy, "--target", target) == (code, report)
+    human = cli("verify", "--repo", repo.root, "--contract", policy, "--target", target)
+    assert human.returncode == 0
+    assert all(token in human.stdout for token in ("PASS", base, target, report["contract_sha256"]))
+
+
+def test_forbidden_precedence_case_sensitivity_and_limit(repo):
+    base = repo.commit("base")
+    repo.write("src/keys/hidden.txt", "private")
+    repo.write("SRC.txt", "case-sensitive scope")
+    repo.write("src/normal.txt", "ordinary")
+    repo.commit("target")
+    policy = contract(repo, base, allowed=("src/**", "src.txt"), forbidden=("**/keys/**",), maximum=2)
+    code, report = verify(repo, policy)
+    assert (code, report["status"], report["scope"]) == (1, "FAIL", "FAIL")
+    assert [(item["code"], item["path"]) for item in report["findings"]] == [
+        ("changed_file_limit", None),
+        ("path_not_allowed", "SRC.txt"),
+        ("forbidden_path", "src/keys/hidden.txt"),
+    ]
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+@pytest.mark.parametrize("blocked", ["protected/original.txt", "src/destination.txt"])
+def test_rename_and_copy_check_both_paths_and_count_once(repo, operation, blocked):
+    repo.write("protected/original.txt", "unchanged content")
+    base = repo.commit("base")
+    target = repo.root / "src/destination.txt"
+    target.parent.mkdir()
+    source = repo.root / "protected/original.txt"
+    if operation == "rename":
+        source.rename(target)
+    else:
+        shutil.copyfile(source, target)
+    repo.commit("target")
+    repo.git("config", "diff.renames", "false")
+    repo.git("config", "diff.renameLimit", "1")
+    policy = contract(repo, base, forbidden=(blocked,), maximum=1)
+    code, report = verify(repo, policy)
+    assert code == 1
+    assert report["changes"] == [{
+        "status": "R" if operation == "rename" else "C",
+        "paths": ["protected/original.txt", "src/destination.txt"],
+        "similarity": 100,
+    }]
+    assert [(item["code"], item["path"]) for item in report["findings"]] == [
+        ("forbidden_path", blocked),
+    ]
+
+
+def test_literal_unicode_and_option_like_paths(repo):
+    base = repo.commit("base")
+    paths = ("-n.txt", "[literal].txt", "snowman-\u2603.txt")
+    for path in paths:
+        repo.write(path, path)
+    repo.commit("target")
+    policy = contract(repo, base, allowed=("-n.txt", "[literal].txt", "snowman-?.txt"))
+    code, report = verify(repo, policy)
+    assert code == 0
+    assert [item["paths"][0] for item in report["changes"]] == list(paths)
+
+
+def test_git_paths_with_tabs_and_newlines_are_preserved(repo):
+    base = repo.commit("base")
+    path = "src/line\nbreak\tname.txt"
+    repo.commit_raw_path(path.encode("utf-8"))
+    policy = contract(repo, base, allowed=("src/*.txt",), forbidden=(path,))
+    code, report = verify(repo, policy)
+    assert code == 1
+    assert report["changes"][0]["paths"] == [path]
+    human = cli("verify", "--repo", repo.root, "--contract", policy)
+    assert r"line\nbreak\tname.txt" in human.stdout
+    assert path not in human.stdout
+
+
+def test_non_utf8_git_path_fails_closed(repo):
+    base = repo.commit("base")
+    repo.commit_raw_path(b"non-utf8-\xff.txt")
+    code, report = verify(repo, contract(repo, base))
+    assert (code, report["status"]) == (2, "ERROR")
+    assert "valid UTF-8" in report["findings"][0]["message"]
+
+
+def test_inexact_copy_uses_committed_attributes_and_blobs(repo):
+    repo.write("protected.txt", "a line with consistent contents\r\n" * 20)
+    base = repo.commit("base")
+    repo.write("copy.txt", "a line with consistent contents\n" * 20 + "another line\n")
+    repo.commit("target")
+    policy = contract(repo, base, forbidden=("protected.txt",))
+    code, report = verify(repo, policy)
+    assert (code, report["changes"][0]["status"]) == (1, "C")
+    assert report["changes"][0]["paths"] == ["protected.txt", "copy.txt"]
+
+    repo.write(".gitattributes", "*.txt -diff\n")
+    repo.git("add", ".gitattributes")
+    repo.write("copy.txt", "dirty worktree contents")
+    assert verify(repo, policy) == (code, report)
+
+
+def test_nonancestor_and_invalid_target_are_errors(repo):
+    base = repo.commit("base")
+    left = repo.commit("left")
+    repo.git("checkout", "--quiet", "--detach", base)
+    right = repo.commit("right")
+    policy = contract(repo, left)
+    code, report = verify(repo, policy)
+    assert (code, report["base_commit"], report["target_commit"]) == (2, left, right)
+    assert "not an ancestor" in report["findings"][0]["message"]
+    assert verify(repo, policy, "--target=--help")[0] == 2
+
+
+def test_annotated_tag_id_is_not_a_pinned_base_commit(repo):
+    repo.commit("base")
+    repo.git("tag", "-a", "tag", "-m", "tag")
+    policy = contract(repo, repo.git("rev-parse", "tag"))
+    code, report = verify(repo, policy)
+    assert code == 2
+    assert "identify the commit itself" in report["findings"][0]["message"]
+
+
+def test_replacement_objects_do_not_change_scope(repo, monkeypatch):
+    repo.write("protected.txt", "base state")
+    base = repo.commit("base")
+    repo.write("protected.txt", "target state")
+    target = repo.commit("target")
+    repo.git("replace", target, base)
+    monkeypatch.setenv("GIT_DIR", str(repo.root.parent / "elsewhere"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "diff.renames")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "false")
+    policy = contract(repo, base, forbidden=("protected.txt",))
+    assert verify(repo, policy)[0] == 1
+
+
+def test_unsupported_type_change_is_an_error(repo):
+    repo.write("entry", "link target")
+    base = repo.commit("base")
+    blob = repo.git("rev-parse", "HEAD:entry")
+    repo.git("update-index", "--cacheinfo", f"120000,{blob},entry")
+    repo.git("commit", "--quiet", "-m", "convert file to a symlink")
+    policy = contract(repo, base)
+    code, report = verify(repo, policy)
+    assert (code, report["status"], report["scope"]) == (2, "ERROR", "NOT_EVALUATED")
+    assert "unsupported Git change status" in report["findings"][0]["message"]
+
+
+def test_checks_need_opt_in_use_literal_arguments_and_target_cwd(repo):
+    repo.write("tracked.txt", "expected")
+    base = repo.commit("base")
+    marker = repo.root.parent / "ran.txt"
+    value = "& > shell-created.txt"
+    name, argv, timeout = python_check(
+        "import sys; from pathlib import Path; "
+        "assert Path('tracked.txt').read_text() == 'expected'; "
+        "assert sys.argv[2] == '& > shell-created.txt'; "
+        "Path(sys.argv[1]).write_text('ran')"
+    )
+    policy = contract(repo, base, checks=((name, [*argv, str(marker), value], timeout),))
+    code, report = verify(repo, policy)
+    assert (code, report["scope"], report["validation"]) == (1, "PASS", "INCOMPLETE")
+    assert report["checks"][0]["status"] == "SKIPPED"
+    assert not marker.exists()
+
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["validation"], report["checks"][0]["exit_code"]) == (0, "PASS", 0)
+    assert marker.read_text() == "ran"
+    assert not (repo.root / "shell-created.txt").exists()
+
+
+def test_scope_failure_does_not_run_checks(repo):
+    base = repo.commit("base")
+    repo.write("blocked.txt", "blocked")
+    repo.commit("target")
+    policy = contract(repo, base, allowed=(), checks=(python_check("raise SystemExit(12)"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["checks"][0]["status"]) == (1, "FAIL", "SKIPPED")
+
+
+def test_contract_from_inside_checkout_cannot_run(repo):
+    base = repo.commit("base")
+    path = contract(repo, base, checks=(python_check("raise SystemExit(12)"),))
+    inside = repo.root / "policy.toml"
+    path.rename(inside)
+    repo.commit("add untrusted contract")
+    code, report = verify(repo, inside, "--run-checks")
+    assert (code, report["validation"], report["checks"][0]["status"]) == (2, "INCOMPLETE", "SKIPPED")
+
+
+@pytest.mark.parametrize("state", ["staged", "unstaged", "assume-unchanged", "ignored", "untracked", "wrong-head"])
+def test_checks_refuse_dirty_or_mismatched_checkout(repo, state):
+    repo.write(".gitignore", "ignored.txt\n")
+    repo.write("tracked.txt", "base")
+    base = repo.commit("base")
+    target = repo.commit("target")
+    if state == "wrong-head":
+        repo.git("checkout", "--quiet", "--detach", base)
+    elif state in {"ignored", "untracked"}:
+        repo.write(f"{state}.txt", "unexpected")
+    else:
+        if state == "assume-unchanged":
+            repo.git("update-index", "--assume-unchanged", "tracked.txt")
+        repo.write("tracked.txt", "modified")
+        if state == "staged":
+            repo.git("add", "tracked.txt")
+    policy = contract(repo, base, checks=(python_check("raise SystemExit(12)"),))
+    code, report = verify(repo, policy, "--target", target, "--run-checks")
+    assert (code, report["scope"], report["validation"]) == (2, "PASS", "ERROR")
+    assert report["checks"][0]["status"] == "ERROR"
+    assert report["checks"][0]["exit_code"] is None
+
+
+def test_status_does_not_execute_configured_filters(repo):
+    repo.write(".gitattributes", "*.txt filter=external\n")
+    repo.write("tracked.txt", "base")
+    base = repo.commit("base")
+    repo.git("config", "filter.external.clean", "external-filter")
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    assert verify(repo, policy)[0] == 1
+    code, report = verify(repo, policy, "--run-checks")
+    assert code == 2
+    assert "filters" in report["checks"][0]["detail"]
+
+
+def test_check_that_dirties_checkout_prevents_later_checks(repo):
+    base = repo.commit("base")
+    policy = contract(repo, base, checks=(
+        python_check("from pathlib import Path; Path('new.txt').write_text('new')", "write"),
+        python_check("raise SystemExit(12)", "second"),
+        python_check("raise SystemExit(12)", "third"),
+    ))
+    code, report = verify(repo, policy, "--run-checks")
+    assert code == 2
+    assert [check["status"] for check in report["checks"]] == ["PASS", "ERROR", "SKIPPED"]
+
+
+def test_check_failure_and_timeout(repo):
+    base = repo.commit("base")
+    policy = contract(repo, base, checks=(
+        python_check("raise SystemExit(7)", "nonzero"),
+        python_check("import time; time.sleep(20)", "slow", timeout=1),
+    ))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["validation"]) == (1, "FAIL")
+    assert [(check["status"], check["exit_code"]) for check in report["checks"]] == [
+        ("FAIL", 7), ("TIMEOUT", None),
+    ]
+
+
+def test_missing_executable_is_an_error(repo):
+    base = repo.commit("base")
+    policy = contract(repo, base, checks=(("missing", ["rangecontract-missing-test-executable"], 1),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["checks"][0]["status"]) == (2, "ERROR")
+
+
+def test_invalid_contract_still_reports_hash(repo):
+    base = repo.commit("base")
+    policy = contract(repo, base, maximum="true")
+    code, report = verify(repo, policy)
+    assert (code, report["scope"]) == (2, "NOT_EVALUATED")
+    assert report["contract_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()

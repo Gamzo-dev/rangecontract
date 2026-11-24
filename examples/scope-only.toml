@@ -1,0 +1,5 @@
+# Replace the placeholder with the full ID of a reviewed base commit.
+base_commit = "0000000000000000000000000000000000000000"
+allowed_paths = ["src/**", "tests/**", "README.md"]
+forbidden_paths = ["src/secrets/**"]
+max_changed_files = 12
