@@ -67,6 +67,24 @@ def _skip(report: Report, checks: tuple[Check, ...], reason: str) -> None:
     report.checks.extend(CheckResult(check.name, "SKIPPED", detail=reason) for check in checks)
 
 
+def _run_check(check: Check, root: Path) -> CheckResult:
+    program = find_executable(check.argv[0], root)
+    try:
+        result = subprocess.run(
+            [str(program), *check.argv[1:]],
+            cwd=root,
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=check.timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return CheckResult(check.name, "TIMEOUT", detail=f"exceeded {check.timeout_seconds} seconds")
+    return CheckResult(check.name, "PASS" if result.returncode == 0 else "FAIL", result.returncode)
+
+
 def _validate(
     report: Report,
     repo: Repository,
@@ -91,32 +109,23 @@ def _validate(
         _skip(report, contract.checks, "execution requires a trusted contract outside the checkout")
         raise GitError("execution requires a trusted contract outside the checkout")
 
+    checkout = None
     for index, check in enumerate(contract.checks):
+        result = None
         try:
-            repo.require_clean_checkout(target)
-            program = find_executable(check.argv[0], repo.root)
-            result = subprocess.run(
-                [str(program), *check.argv[1:]],
-                cwd=repo.root,
-                shell=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=check.timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            report.checks.append(CheckResult(
-                check.name, "TIMEOUT", detail=f"exceeded {check.timeout_seconds} seconds",
-            ))
+            if checkout is None:
+                checkout = repo.checkout_tree(target)
+            repo.require_clean_checkout(target, checkout)
+            result = _run_check(check, repo.root)
+            repo.require_clean_checkout(target, checkout)
         except (OSError, ValueError, RuntimeError) as exc:
-            report.checks.append(CheckResult(check.name, "ERROR", detail=str(exc)))
-            _skip(report, contract.checks[index + 1:], "a validation check could not run")
+            detail = str(exc) if result is None else f"post-validation checkout: {exc}"
+            exit_code = None if result is None else result.exit_code
+            report.checks.append(CheckResult(check.name, "ERROR", exit_code, detail))
+            _skip(report, contract.checks[index + 1:], "validation could not continue")
             report.validation = "ERROR"
-            raise GitError("a required validation check could not run") from exc
-        else:
-            status = "PASS" if result.returncode == 0 else "FAIL"
-            report.checks.append(CheckResult(check.name, status, exit_code=result.returncode))
+            raise GitError("a required validation check could not complete") from exc
+        report.checks.append(result)
     report.validation = (
         "PASS" if all(check.status == "PASS" for check in report.checks) else "FAIL"
     )

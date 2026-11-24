@@ -3,8 +3,8 @@
 Use Python 3.11+ and Git 2.42+. Create an isolated development environment, then run these commands from the repository root.
 
 ```sh
-python -m pip install -e ".[dev]"
-python -m pytest
+python -I -m pip install ".[dev]"
+python -I -m pytest
 python -m build
 python -m twine check --strict dist/*
 ```

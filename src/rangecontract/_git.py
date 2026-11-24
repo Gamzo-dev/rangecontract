@@ -7,6 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._checkout import Checkout
 from ._contract import OBJECT_ID
 from ._process import find_executable
 
@@ -176,32 +177,23 @@ class Repository:
                 ),
             ).stdout)
 
-    def require_clean_checkout(self, target: str) -> None:
+    def checkout_tree(self, target: str) -> Checkout:
         if self.bare:
             raise GitError("validation requires a working tree")
+        tree = self._run("ls-tree", "-r", "-t", "-l", "-z", "--full-tree", target, "--")
+        return Checkout.from_tree(tree.stdout, target)
+
+    def require_clean_checkout(self, target: str, checkout: Checkout) -> None:
+        checkout.require_match(self.root)
+        if self._git_path("rev-parse", "--show-toplevel").resolve() != self.root:
+            raise GitError("validation requires the target repository root")
         if self.resolve_commit("HEAD") != target:
             raise GitError("validation checkout HEAD does not match the target commit")
         if self._has_config(r"^filter\..*\.(clean|process)$"):
             raise GitError("validation does not support configured Git clean or process filters")
         staged = self._run(
-            "diff-index", "--cached", "--quiet", "--no-ext-diff", "--ignore-submodules=none",
-            target, "--", accepted=(0, 1),
+            "diff-index", "--cached", "--quiet", "--no-ext-diff", "--no-textconv",
+            "--ignore-submodules=none", target, "--", accepted=(0, 1),
         )
         if staged.returncode == 1:
             raise GitError("validation checkout index differs from the target commit")
-
-        # A fresh index forces Git to inspect the working tree independently
-        # of cached stat data and flags such as assume-unchanged.
-        with tempfile.TemporaryDirectory(prefix="rangecontract-index-") as temporary:
-            index = Path(temporary) / "index"
-            options = ("-c", "core.splitIndex=false", "-c", "core.sparseCheckout=false")
-            self._run("read-tree", target, index=index, options=options)
-            entries = self._run("ls-files", "--stage", "-z", index=index).stdout
-            if any(entry.startswith(b"160000 ") for entry in entries.split(b"\0")):
-                raise GitError("validation does not support checkouts with submodules")
-            status = self._run(
-                "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching",
-                "--ignore-submodules=none", index=index, options=options,
-            )
-            if status.stdout:
-                raise GitError("validation checkout has modified, untracked, or ignored files")

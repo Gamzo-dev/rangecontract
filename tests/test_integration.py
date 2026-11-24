@@ -33,6 +33,19 @@ class Repo:
         )
         self.git("commit", "--quiet", "-m", "add raw path")
 
+    def commit_tree(self, entries):
+        """Write a tree even when the filesystem cannot materialize its paths."""
+        base = self.git("rev-parse", "HEAD")
+        records = []
+        for mode, path, contents in entries:
+            oid = self.git_bytes("hash-object", "-w", "--stdin", data=contents).strip()
+            records.append(mode + b" blob " + oid + b"\t" + path + b"\0")
+        tree = self.git_bytes("mktree", "-z", data=b"".join(records)).decode().strip()
+        target = self.git("commit-tree", tree, "-p", base, "-m", "tree fixture")
+        self.git("update-ref", "refs/heads/main", target)
+        self.git("read-tree", target)
+        return target
+
     def write(self, relative, content):
         path = self.root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +71,7 @@ def repo(tmp_path):
 
 def cli(*args, **kwargs):
     return subprocess.run(
-        [sys.executable, "-B", "-m", "rangecontract", *map(str, args)],
+        [sys.executable, "-I", "-B", "-m", "rangecontract", *map(str, args)],
         capture_output=True, text=True, timeout=45, **kwargs,
     )
 
@@ -332,6 +345,7 @@ def test_checks_refuse_dirty_or_mismatched_checkout(repo, state):
         repo.write("tracked.txt", "modified")
         if state == "staged":
             repo.git("add", "tracked.txt")
+            repo.write("tracked.txt", "base")
     policy = contract(repo, base, checks=(python_check("raise SystemExit(12)"),))
     code, report = verify(repo, policy, "--target", target, "--run-checks")
     assert (code, report["scope"], report["validation"]) == (2, "PASS", "ERROR")
@@ -360,7 +374,9 @@ def test_check_that_dirties_checkout_prevents_later_checks(repo):
     ))
     code, report = verify(repo, policy, "--run-checks")
     assert code == 2
-    assert [check["status"] for check in report["checks"]] == ["PASS", "ERROR", "SKIPPED"]
+    assert [check["status"] for check in report["checks"]] == ["ERROR", "SKIPPED", "SKIPPED"]
+    assert report["checks"][0]["exit_code"] == 0
+    assert "post-validation checkout" in report["checks"][0]["detail"]
 
 
 def test_check_failure_and_timeout(repo):
@@ -389,3 +405,171 @@ def test_invalid_contract_still_reports_hash(repo):
     code, report = verify(repo, policy)
     assert (code, report["scope"]) == (2, "NOT_EVALUATED")
     assert report["contract_sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("shadow", ["module", "package", "pythonpath"])
+def test_installed_isolated_cli_ignores_shadowing(repo, shadow):
+    base = repo.commit("base")
+    repo.write("blocked.txt", "policy rejects this path")
+    repo.commit("scope fixture")
+    policy = contract(repo, base, forbidden=("blocked.txt",))
+    source = "print('shadow fixture selected')\n"
+    env = os.environ.copy()
+    if shadow == "module":
+        repo.write("rangecontract.py", source)
+    elif shadow == "package":
+        repo.write("rangecontract/__init__.py", source)
+        repo.write("rangecontract/__main__.py", "")
+    else:
+        injected = repo.root.parent / "injected"
+        package = injected / "rangecontract"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text(source, encoding="utf-8")
+        (package / "__main__.py").write_text("", encoding="utf-8")
+        env["PYTHONPATH"] = str(injected)
+
+    result = cli("verify", "--repo", repo.root, "--contract", policy, "--json", cwd=repo.root, env=env)
+    assert result.returncode == 1
+    assert result.stderr == ""
+    report = json.loads(result.stdout)
+    assert report["status"] == "FAIL"
+    assert report["findings"][0]["code"] == "forbidden_path"
+
+
+def test_validation_rejects_case_collisions_in_target_tree(repo):
+    base = repo.commit("base")
+    repo.commit_tree([
+        (b"100644", b"ONE.txt", b"same bytes"),
+        (b"100644", b"one.txt", b"same bytes"),
+    ])
+    repo.write("ONE.txt", "same bytes")
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["checks"][0]["exit_code"]) == (2, "PASS", None)
+    assert "path collision" in report["checks"][0]["detail"]
+
+
+def test_validation_rejects_case_mismatch_even_for_identical_bytes(repo):
+    repo.write("ONE.txt", "same bytes")
+    base = repo.commit("base")
+    (repo.root / "ONE.txt").unlink()
+    repo.write("one.txt", "same bytes")
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert code == 2
+    assert "unexpected validation checkout entry 'one.txt'" in report["checks"][0]["detail"]
+
+
+def test_validation_rejects_symlink_materialized_as_text(repo):
+    repo.git("config", "core.symlinks", "false")
+    base = repo.commit("base")
+    repo.commit_tree([(b"120000", b"link.txt", b"destination.txt")])
+    repo.write("link.txt", "destination.txt")
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["checks"][0]["exit_code"]) == (2, "PASS", None)
+    assert "unsupported Git tree entry b'120000'" in report["checks"][0]["detail"]
+
+
+def test_validation_rejects_submodules_without_inspecting_their_checkouts(repo):
+    base = repo.commit("base")
+    repo.git("update-index", "--add", "--cacheinfo", f"160000,{base},vendor")
+    repo.git("commit", "--quiet", "-m", "add gitlink")
+    assert verify(repo, contract(repo, base))[0] == 0
+
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert code == 2
+    assert "unsupported Git tree entry b'160000'" in report["checks"][0]["detail"]
+
+
+@pytest.mark.parametrize(("attribute", "blob", "worktree"), [
+    ("ident", b"$Id$\n", b"$Id: alternate $\n"),
+    ("text eol=crlf", b"one\ntwo\n", b"one\r\ntwo\r\n"),
+])
+def test_validation_rejects_transformed_bytes_git_status_accepts(repo, attribute, blob, worktree):
+    base = repo.commit("base")
+    attrs = f"tracked.txt {attribute}\n".encode()
+    repo.commit_tree([
+        (b"100644", b".gitattributes", attrs),
+        (b"100644", b"tracked.txt", blob),
+    ])
+    (repo.root / ".gitattributes").write_bytes(attrs)
+    (repo.root / "tracked.txt").write_bytes(worktree)
+    assert repo.git("status", "--porcelain") == ""
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["checks"][0]["exit_code"]) == (2, "PASS", None)
+    assert "raw content differs" in report["checks"][0]["detail"]
+
+
+def test_validation_rejects_hidden_nested_git_directory(repo):
+    repo.write("src/tracked.txt", "ordinary content")
+    base = repo.commit("base")
+    repo.write("src/.git/untracked.txt", "unexpected content")
+    assert repo.git("status", "--porcelain", "--untracked-files=all", "--ignored=matching") == ""
+    assert verify(repo, contract(repo, base))[0] == 0
+
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["checks"][0]["exit_code"]) == (2, "PASS", None)
+    assert "unexpected validation checkout entry 'src/.git'" in report["checks"][0]["detail"]
+
+
+def test_validation_does_not_follow_directory_links(repo):
+    repo.write("src/tracked.txt", "ordinary content")
+    base = repo.commit("base")
+    outside = repo.root.parent / "outside"
+    (repo.root / "src").rename(outside)
+    link = repo.root / "src"
+    if os.name == "nt":
+        env = {**os.environ, "RANGECONTRACT_TEST_LINK": str(link), "RANGECONTRACT_TEST_DESTINATION": str(outside)}
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             "New-Item -ItemType Junction -Path $env:RANGECONTRACT_TEST_LINK "
+             "-Target $env:RANGECONTRACT_TEST_DESTINATION -ErrorAction Stop | Out-Null"],
+            env=env, check=True, capture_output=True, timeout=15,
+        )
+    else:
+        link.symlink_to(outside, target_is_directory=True)
+
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["checks"][0]["exit_code"]) == (2, None)
+    assert "link or reparse point" in report["checks"][0]["detail"]
+
+
+@pytest.mark.parametrize(("source", "detail"), [
+    ("Path('tracked.txt').write_bytes(b'fake')", "raw content differs"),
+    ("Path('extra-empty').mkdir()", "unexpected validation checkout entry"),
+    ("Path('src/.git').mkdir()", "unexpected validation checkout entry"),
+])
+def test_fidelity_is_checked_after_the_final_command(repo, source, detail):
+    repo.write("tracked.txt", "base")
+    repo.write("src/tracked.txt", "ordinary content")
+    base = repo.commit("base")
+    policy = contract(repo, base, checks=(python_check(f"from pathlib import Path; {source}"),))
+
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["validation"], report["checks"][0]["status"]) == (2, "ERROR", "ERROR")
+    assert report["checks"][0]["exit_code"] == 0
+    assert report["checks"][0]["detail"].startswith("post-validation checkout:")
+    assert detail in report["checks"][0]["detail"]
+
+
+def test_scope_only_works_without_a_worktree(tmp_path):
+    root = tmp_path / "bare"
+    root.mkdir()
+    repo = Repo(root)
+    repo.git("init", "--quiet", "--bare", "--initial-branch=main", "--template=")
+    repo.git("config", "user.name", "RangeContract Tests")
+    repo.git("config", "user.email", "rangecontract@example.invalid")
+    tree = repo.git_bytes("mktree", data=b"").decode().strip()
+    base = repo.git("commit-tree", tree, "-m", "base")
+    repo.git("update-ref", "refs/heads/main", base)
+    assert verify(repo, contract(repo, base))[0] == 0
+
+    policy = contract(repo, base, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert code == 2
+    assert "requires a working tree" in report["checks"][0]["detail"]

@@ -1,4 +1,5 @@
 # Replace the placeholder, then store this contract outside the checkout.
+# Use python -I -m rangecontract verify --run-checks with a byte-exact checkout.
 base_commit = "0000000000000000000000000000000000000000"
 allowed_paths = ["src/**", "tests/**", "pyproject.toml"]
 forbidden_paths = ["src/secrets/**", "tests/fixtures/private/**"]
@@ -6,5 +7,5 @@ max_changed_files = 20
 
 [[checks]]
 name = "unit tests"
-argv = ["python", "-B", "-m", "pytest", "-p", "no:cacheprovider"]
+argv = ["python", "-I", "-B", "-m", "pytest", "-p", "no:cacheprovider"]
 timeout_seconds = 120
