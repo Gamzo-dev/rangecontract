@@ -573,3 +573,33 @@ def test_scope_only_works_without_a_worktree(tmp_path):
     code, report = verify(repo, policy, "--run-checks")
     assert code == 2
     assert "requires a working tree" in report["checks"][0]["detail"]
+
+
+def test_validation_rejects_unicode_collision_before_running_a_command(repo):
+    repo.commit("base")
+    target = repo.commit_tree([
+        (b"100644", "\u03b1\u0345\u0301.txt".encode(), b"first ordinary file\n"),
+        (b"100644", "\u03b1\u0301\u0345.txt".encode(), b"second ordinary file\n"),
+    ])
+    scope_only = contract(repo, target, allowed=(), maximum=0)
+    assert verify(repo, scope_only)[0] == 0
+
+    marker = repo.root.parent / "validation-ran"
+    name, argv, timeout = python_check("import sys; from pathlib import Path; Path(sys.argv[1]).touch()")
+    policy = contract(repo, target, allowed=(), maximum=0, checks=((name, [*argv, str(marker)], timeout),))
+    code, report = verify(repo, policy, "--run-checks")
+
+    assert (code, report["scope"], report["validation"]) == (2, "PASS", "ERROR")
+    check, = report["checks"]
+    assert (check["status"], check["exit_code"]) == ("ERROR", None)
+    assert "validation tree path collision" in check["detail"]
+    assert not marker.exists()
+
+
+def test_validation_accepts_ordinary_checkout_without_collisions(repo):
+    repo.write("src/ordinary.txt", "a regular file\n")
+    target = repo.commit("ordinary checkout")
+    policy = contract(repo, target, allowed=(), maximum=0, checks=(python_check("pass"),))
+    code, report = verify(repo, policy, "--run-checks")
+    assert (code, report["scope"], report["validation"]) == (0, "PASS", "PASS")
+    assert report["checks"][0]["exit_code"] == 0

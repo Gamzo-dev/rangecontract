@@ -28,7 +28,9 @@ class Blob:
 
 
 def _component_key(name: str) -> str:
-    return unicodedata.normalize("NFC", name.casefold())
+    # Unicode D145 canonical caseless matching.
+    decomposed = unicodedata.normalize("NFD", name)
+    return unicodedata.normalize("NFD", decomposed.casefold())
 
 
 def _portable_component(name: str) -> bool:
