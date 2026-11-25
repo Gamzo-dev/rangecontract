@@ -2,6 +2,8 @@
 
 RangeContract verifies the net Git tree changes from a pinned base commit to a target commit against a trusted TOML contract. It checks path scope and file count, and can explicitly run required local validation commands.
 
+Browse the [source code](https://github.com/Gamzo-dev/rangecontract) or report general bugs in the [issue tracker](https://github.com/Gamzo-dev/rangecontract/issues).
+
 ## Quick start
 
 Use Python 3.11+ and Git 2.42+ on PATH. From a trusted RangeContract source checkout, create a virtual environment in a trusted location outside the checkout you plan to verify. Activate it and install the package with `python -I -m pip install .`. You can also install a trusted wheel with that interpreter. Use a regular installation in the environment's site-packages so Python isolated mode can find it.

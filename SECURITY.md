@@ -10,4 +10,8 @@ RangeContract checks exact path spellings, file types, raw Git blob IDs and Git 
 
 Git's rename and copy heuristics can classify changes differently based on target attributes and ambiguous source candidates. Forbidden paths apply to Git's reported records and do not guarantee information flow or copy provenance.
 
-Report suspected vulnerabilities privately to the repository owner through a private contact channel. Include the version, affected platform and a description with sensitive data removed.
+## Reporting a vulnerability
+
+Open [Report a vulnerability](https://github.com/Gamzo-dev/rangecontract/security/advisories/new) while signed in to GitHub to submit a private report to the maintainers. You can also open the repository's [Security Advisories](https://github.com/Gamzo-dev/rangecontract/security/advisories) page and select **Report a vulnerability**.
+
+Include the RangeContract version, affected platform, impact, and steps to reproduce. Remove credentials and other sensitive data before submitting.

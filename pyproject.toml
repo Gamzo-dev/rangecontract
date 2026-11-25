@@ -21,6 +21,11 @@ classifiers = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "build>=1", "twine>=6"]
 
+[project.urls]
+Homepage = "https://github.com/Gamzo-dev/rangecontract"
+Repository = "https://github.com/Gamzo-dev/rangecontract"
+Issues = "https://github.com/Gamzo-dev/rangecontract/issues"
+
 [project.scripts]
 rangecontract = "rangecontract.cli:main"
 
