@@ -1,0 +1,205 @@
+name: Publish RangeContract 0.1.0 to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_commit:
+        description: Full SHA of the approved main commit
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: pypi-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build distributions
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Require the approved commit
+        env:
+          RELEASE_COMMIT: ${{ inputs.release_commit }}
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ] || [ "$GITHUB_SHA" != "$RELEASE_COMMIT" ]; then
+            echo "Dispatch must target the exact approved commit on refs/heads/main."
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - name: Build wheel and source distribution
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python -I -m pip install build==1.6.1
+          python -I -m build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+
+  verify:
+    name: Verify distributions
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: verified/dist/
+      - name: Check package metadata and contents
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python -I -m pip install twine==7.0.0
+          python -I -m twine check --strict verified/dist/*
+          python -I - <<'PY'
+          from email import policy
+          from email.parser import BytesParser
+          from pathlib import Path
+          import tarfile
+          from zipfile import ZipFile
+
+          from packaging.requirements import Requirement
+
+          distribution = "rangecontract-0.1.0"
+          dist = Path("verified/dist")
+          wheel = dist / f"{distribution}-py3-none-any.whl"
+          sdist = dist / f"{distribution}.tar.gz"
+          assert set(dist.iterdir()) == {wheel, sdist}, "Unexpected release files"
+
+          modules = sorted(Path("src/rangecontract").glob("*.py"))
+          assert modules, "Missing package modules"
+          wheel_sources = {path.relative_to("src").as_posix(): path for path in modules}
+          dist_info = f"{distribution}.dist-info/"
+          wheel_metadata = {
+              dist_info + name for name in (
+                  "METADATA", "WHEEL", "RECORD", "entry_points.txt", "top_level.txt"
+              )
+          }
+          wheel_sources[dist_info + "licenses/LICENSE"] = Path("LICENSE")
+
+          def check_metadata(data):
+              metadata = BytesParser(policy=policy.default).parsebytes(data)
+              assert metadata.get_all("Name") == ["rangecontract"]
+              assert metadata.get_all("Version") == ["0.1.0"]
+              assert metadata.get_all("Requires-Python") == [">=3.11"]
+              assert metadata.get_all("Provides-Extra") == ["dev"]
+              requirements = [
+                  Requirement(value) for value in metadata.get_all("Requires-Dist", [])
+              ]
+              assert all(str(req.marker) == 'extra == "dev"' for req in requirements), (
+                  "The package must have zero runtime dependencies"
+              )
+              assert sorted(req.name for req in requirements) == ["build", "pytest", "twine"]
+
+          with ZipFile(wheel) as archive:
+              names = archive.namelist()
+              assert len(names) == len(set(names)), "Duplicate wheel entries"
+              assert set(names) == set(wheel_sources) | wheel_metadata, names
+              for name, source in wheel_sources.items():
+                  assert archive.read(name) == source.read_bytes(), name
+              check_metadata(archive.read(dist_info + "METADATA"))
+              assert b"rangecontract = rangecontract.cli:main" in archive.read(
+                  dist_info + "entry_points.txt"
+              )
+
+          sdist_sources = modules + [
+              *Path("examples").glob("*.toml"),
+              *Path("tests").glob("*.py"),
+              *map(Path, (
+                  "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "MANIFEST.in",
+                  "README.md", "SECURITY.md", "pyproject.toml",
+              )),
+          ]
+          prefix = distribution + "/"
+          sdist_metadata = {"PKG-INFO", "setup.cfg"} | {
+              "src/rangecontract.egg-info/" + name for name in (
+                  "PKG-INFO", "SOURCES.txt", "dependency_links.txt",
+                  "entry_points.txt", "requires.txt", "top_level.txt",
+              )
+          }
+          with tarfile.open(sdist, "r:gz") as archive:
+              members = [member for member in archive if not member.isdir()]
+              names = [member.name for member in members]
+              expected = {path.as_posix() for path in sdist_sources} | sdist_metadata
+              assert len(names) == len(set(names)), "Duplicate sdist entries"
+              assert set(names) == {prefix + name for name in expected}, names
+              assert all(member.isfile() for member in members), "Non-file sdist entry"
+              for source in sdist_sources:
+                  assert archive.extractfile(prefix + source.as_posix()).read() == (
+                      source.read_bytes()
+                  ), source
+              check_metadata(archive.extractfile(prefix + "PKG-INFO").read())
+              check_metadata(archive.extractfile(
+                  prefix + "src/rangecontract.egg-info/PKG-INFO"
+              ).read())
+
+          print("Verified RangeContract 0.1.0 wheel and sdist with zero runtime dependencies")
+          PY
+      - name: Record verified SHA-256 digests
+        working-directory: verified
+        run: |
+          sha256sum dist/* > SHA256SUMS
+          {
+            echo '### Verified distribution SHA-256 hashes'
+            echo
+            echo '~~~text'
+            cat SHA256SUMS
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        id: upload
+        with:
+          name: verified-distributions
+          path: verified/
+          if-no-files-found: error
+
+  publish:
+    name: Publish verified distributions
+    if: github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/rangecontract/0.1.0/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact-id }}
+          path: verified/
+      - name: Confirm verified artifact digests
+        working-directory: verified
+        run: sha256sum --strict --check SHA256SUMS
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: verified/dist/
+          attestations: true

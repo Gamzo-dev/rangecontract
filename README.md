@@ -6,10 +6,18 @@ Browse the [source code](https://github.com/Gamzo-dev/rangecontract) or report g
 
 ## Quick start
 
-Use Python 3.11+ and Git 2.42+ on PATH. From a trusted RangeContract source checkout, create a virtual environment in a trusted location outside the checkout you plan to verify. Activate it and install the package with `python -I -m pip install .`. You can also install a trusted wheel with that interpreter. Use a regular installation in the environment's site-packages so Python isolated mode can find it.
+Use Python 3.11+ and Git 2.42+ on PATH. Create and activate a virtual environment in a trusted location outside the checkout you plan to verify. Install from PyPI and check the version.
 
 ```sh
+python -I -m pip install rangecontract
 python -I -m rangecontract version
+```
+
+To install from a trusted RangeContract source checkout, use `python -I -m pip install .` from that source directory or install a trusted wheel with the same interpreter. Use a regular installation in the environment's site-packages so Python isolated mode can find it.
+
+Run the verifier with the trusted interpreter.
+
+```sh
 python -I -m rangecontract init --repo /path/to/repo --base main --contract /trusted/change.toml
 python -I -m rangecontract verify --repo /path/to/repo --contract /trusted/change.toml --target feature
 python -I -m rangecontract verify --repo /path/to/repo --contract /trusted/change.toml --target feature --json
